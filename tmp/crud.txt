@@ -1,0 +1,1010 @@
+use std::collections::HashMap;
+
+use anyhow::{Ok, Result, anyhow, bail};
+use sqlparser::ast::{
+    BinaryOperator, Expr, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, Statement,
+    TableFactor, TableWithJoins, Value, Assignment, Delete, Insert, InsertSource,
+    CreateTable, CreateIndex, Drop, DropStatement, ColumnDef, DataType, TableConstraint,
+};
+
+#[derive(Debug, Clone)]
+pub enum LogicalPlan {
+    TableScan {
+        table_name: String,
+        alias: Option<String>,
+        projected_schema: Vec<String>,
+    }
+    Projection {
+        expressions: Vec<LogicalExpr>,
+        input: Box<LogicalPlan>,
+    },
+    Filter {
+        predicate: LogicalExpr,
+        input: Box<LogicalPlan>,
+    },
+    Join {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        join_type: JoinType,
+        join_constraint: Option<LogicalExpr>,
+    },
+    Insert {
+        table_name: String,
+        columns: Option<Vec<String>>,
+        values: Vec<Vec<LogicalExpr>>,
+        source: Option<Box<LogicalPlan>>, // For INSERT ... SELECT
+    },
+    Update {
+        table_name: String,
+        assignments: Vec<UpdateAssignment>,
+        filter: Option<LogicalExpr>,
+        from: Option<Box<LogicalPlan>>,
+    },
+    Delete {
+        table_name: String,
+        filter: Option<LogicalExpr>,
+    },
+    CreateTable {
+        table_name: String,
+        columns: Vec<ColumnDefinition>,
+        constraints: Vec<TableConstraintDef>,
+        if_not_exists: bool,
+    },
+    CreateIndex {
+        index_name: String,
+        table_name: String,
+        columns: Vec<String>,
+        unique: bool,
+        if_not_exists: bool,
+    },
+    DropTable {
+        table_names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
+    DropIndex {
+        index_names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateAssignment {
+    pub column: String,
+    pub value: LogicalExpr,
+}
+
+#[derive(Debug, Clone)]
+pub struct ColumnDefinition {
+    pub name: String,
+    pub data_type: DataTypeEnum,
+    pub nullable: bool,
+    pub default: Option<LogicalExpr>,
+    pub primary_key: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum DataTypeEnum {
+    Varchar(Option<u64>),
+    Integer,
+    BigInt,
+    Float,
+    Double,
+    Boolean,
+    Date,
+    Timestamp,
+    Text,
+}
+
+#[derive(Debug, Clone)]
+pub enum TableConstraintDef {
+    PrimaryKey { columns: Vec<String> },
+    ForeignKey { 
+        columns: Vec<String>, 
+        foreign_table: String, 
+        foreign_columns: Vec<String> 
+    },
+    Unique { columns: Vec<String> },
+    Check { expr: LogicalExpr },
+}
+
+#[derive(Debug, Clone)]
+pub enum LogicalExpr {
+    Column {
+        name: String,
+        table: Option<String>,
+    },
+    Literal(ScalarValue),
+    BinaryExpr {
+        left: Box<LogicalExpr>,
+        op: BinaryOperator,
+        right: Box<LogicalExpr>,
+    },
+    Wildcard {
+        table: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum ScalarValue {
+    Utf8(String),
+    Int64(i64),
+    Float64(f64),
+    Boolean(bool),
+    Null,
+}
+
+#[derive(Debug, Clone)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Cross,
+}
+
+pub struct Planner {
+    pub catalog: HashMap<String, Vec<String>>,
+}
+
+impl Planner {
+    pub fn new(catalog: HashMap<String, Vec<String>>) -> Self {
+        Self { catalog: catalog }
+    }
+
+    pub fn generate(&self, stmt: &Statement) -> Result<LogicalPlan> {
+        return match stmt {
+            Statement::Query(query) => self.plan_query(&query),
+            Statement::CreateTable(table) => self.plan_create_table(table),
+            Statement::CreateIndex(index) => self.plan_create_index(index),
+            Statement::Drop(drop_stmt) => self.plan_drop(drop_stmt),
+            Statement::Insert(insert) => self.plan_insert(insert),
+            Statement::Update {
+                table,
+                assignments,
+                from,
+                selection,
+                returning: _,
+                or: _,
+            } => self.plan_update(table, assignments, from, selection),
+            Statement::Delete(delete) => self.plan_delete(delete),
+            _ => {
+                return Err(anyhow!("Unsupported Statement"));
+            }
+        };
+    }
+
+    fn plan_insert(&self, insert: &Insert) -> Result<LogicalPlan> {
+        let table_name = self.extract_table_name(&insert.table_name)?;
+        
+        // Validate table exists in catalog
+        if !self.catalog.contains_key(&table_name) {
+            return Err(anyhow!("Table '{}' does not exist", table_name));
+        }
+
+        let columns = insert.columns.as_ref().map(|cols| {
+            cols.iter().map(|col| col.value.clone()).collect()
+        });
+
+        match &insert.source {
+            Some(source) => match source {
+                InsertSource::Query(query) => {
+                    let source_plan = self.plan_query(query)?;
+                    Ok(LogicalPlan::Insert {
+                        table_name,
+                        columns,
+                        values: vec![],
+                        source: Some(Box::new(source_plan)),
+                    })
+                }
+                InsertSource::Values(values_expr) => {
+                    let mut values = Vec::new();
+                    for row in &values_expr.rows {
+                        let mut row_values = Vec::new();
+                        for expr in row {
+                            row_values.push(self.expr_to_logical_expr(expr)?);
+                        }
+                        values.push(row_values);
+                    }
+                    Ok(LogicalPlan::Insert {
+                        table_name,
+                        columns,
+                        values,
+                        source: None,
+                    })
+                }
+                _ => bail!("Unsupported INSERT source"),
+            },
+            None => bail!("INSERT statement must have a source"),
+        }
+    }
+
+    fn plan_update(
+        &self,
+        table: &TableWithJoins,
+        assignments: &[Assignment],
+        from: &Option<Vec<TableWithJoins>>,
+        selection: &Option<Expr>,
+    ) -> Result<LogicalPlan> {
+        let table_name = match &table.relation {
+            TableFactor::Table { name, .. } => self.extract_table_name(name)?,
+            _ => bail!("Only table updates are supported"),
+        };
+
+        // Validate table exists in catalog
+        if !self.catalog.contains_key(&table_name) {
+            return Err(anyhow!("Table '{}' does not exist", table_name));
+        }
+
+        let mut update_assignments = Vec::new();
+        for assignment in assignments {
+            let column = match &assignment.target {
+                sqlparser::ast::AssignmentTarget::ColumnName(name) => {
+                    if name.0.len() == 1 {
+                        name.0[0].value.clone()
+                    } else {
+                        bail!("Complex column names not supported in UPDATE");
+                    }
+                }
+                _ => bail!("Only simple column assignments are supported"),
+            };
+            
+            let value = self.expr_to_logical_expr(&assignment.value)?;
+            update_assignments.push(UpdateAssignment { column, value });
+        }
+
+        let filter = match selection {
+            Some(expr) => Some(self.expr_to_logical_expr(expr)?),
+            None => None,
+        };
+
+        let from_plan = match from {
+            Some(from_tables) => {
+                if !from_tables.is_empty() {
+                    Some(Box::new(self.plan_from_clause(from_tables)?))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
+        Ok(LogicalPlan::Update {
+            table_name,
+            assignments: update_assignments,
+            filter,
+            from: from_plan,
+        })
+    }
+
+    fn plan_create_table(&self, create_table: &CreateTable) -> Result<LogicalPlan> {
+        let table_name = self.extract_table_name(&create_table.name)?;
+        
+        // Check if table already exists when IF NOT EXISTS is not specified
+        if !create_table.if_not_exists && self.catalog.contains_key(&table_name) {
+            return Err(anyhow!("Table '{}' already exists", table_name));
+        }
+
+        let mut columns = Vec::new();
+        let mut constraints = Vec::new();
+
+        // Process column definitions
+        for column_def in &create_table.columns {
+            let column = self.convert_column_def(column_def)?;
+            columns.push(column);
+        }
+
+        // Process table constraints
+        for constraint in &create_table.constraints {
+            let table_constraint = self.convert_table_constraint(constraint)?;
+            constraints.push(table_constraint);
+        }
+
+        Ok(LogicalPlan::CreateTable {
+            table_name,
+            columns,
+            constraints,
+            if_not_exists: create_table.if_not_exists,
+        })
+    }
+
+    fn plan_create_index(&self, create_index: &CreateIndex) -> Result<LogicalPlan> {
+        let index_name = create_index.name.as_ref()
+            .map(|name| self.extract_table_name(name))
+            .transpose()?
+            .unwrap_or_else(|| format!("idx_auto_{}", std::ptr::addr_of!(create_index) as usize));
+
+        let table_name = self.extract_table_name(&create_index.table_name)?;
+
+        // Validate table exists
+        if !self.catalog.contains_key(&table_name) {
+            return Err(anyhow!("Table '{}' does not exist", table_name));
+        }
+
+        let mut columns = Vec::new();
+        for column_expr in &create_index.columns {
+            match column_expr {
+                Expr::Identifier(ident) => columns.push(ident.value.clone()),
+                Expr::CompoundIdentifier(parts) => {
+                    if parts.len() == 1 {
+                        columns.push(parts[0].value.clone());
+                    } else {
+                        bail!("Complex column expressions not supported in CREATE INDEX");
+                    }
+                }
+                _ => bail!("Only simple column references are supported in CREATE INDEX"),
+            }
+        }
+
+        Ok(LogicalPlan::CreateIndex {
+            index_name,
+            table_name,
+            columns,
+            unique: create_index.unique,
+            if_not_exists: create_index.if_not_exists,
+        })
+    }
+
+    fn plan_drop(&self, drop_stmt: &DropStatement) -> Result<LogicalPlan> {
+        match &drop_stmt.object_type {
+            sqlparser::ast::ObjectType::Table => {
+                let mut table_names = Vec::new();
+                for name in &drop_stmt.names {
+                    table_names.push(self.extract_table_name(name)?);
+                }
+
+                // Validate tables exist when IF EXISTS is not specified
+                if !drop_stmt.if_exists {
+                    for table_name in &table_names {
+                        if !self.catalog.contains_key(table_name) {
+                            return Err(anyhow!("Table '{}' does not exist", table_name));
+                        }
+                    }
+                }
+
+                Ok(LogicalPlan::DropTable {
+                    table_names,
+                    if_exists: drop_stmt.if_exists,
+                    cascade: drop_stmt.cascade,
+                })
+            }
+            sqlparser::ast::ObjectType::Index => {
+                let mut index_names = Vec::new();
+                for name in &drop_stmt.names {
+                    index_names.push(self.extract_table_name(name)?);
+                }
+
+                Ok(LogicalPlan::DropIndex {
+                    index_names,
+                    if_exists: drop_stmt.if_exists,
+                    cascade: drop_stmt.cascade,
+                })
+            }
+            _ => bail!("Only DROP TABLE and DROP INDEX are supported"),
+        }
+    }
+
+    fn convert_column_def(&self, column_def: &ColumnDef) -> Result<ColumnDefinition> {
+        let name = column_def.name.value.clone();
+        let data_type = self.convert_data_type(&column_def.data_type)?;
+        
+        let mut nullable = true;
+        let mut default = None;
+        let mut primary_key = false;
+
+        // Process column options
+        for option in &column_def.options {
+            match &option.option {
+                sqlparser::ast::ColumnOption::NotNull => nullable = false,
+                sqlparser::ast::ColumnOption::Null => nullable = true,
+                sqlparser::ast::ColumnOption::Default(expr) => {
+                    default = Some(self.expr_to_logical_expr(expr)?);
+                }
+                sqlparser::ast::ColumnOption::Unique { is_primary } => {
+                    if *is_primary {
+                        primary_key = true;
+                        nullable = false;
+                    }
+                }
+                _ => {} // Ignore other options for now
+            }
+        }
+
+        Ok(ColumnDefinition {
+            name,
+            data_type,
+            nullable,
+            default,
+            primary_key,
+        })
+    }
+
+    fn convert_data_type(&self, data_type: &DataType) -> Result<DataTypeEnum> {
+        match data_type {
+            DataType::Varchar(size) => Ok(DataTypeEnum::Varchar(size.map(|s| s as u64))),
+            DataType::Char(size) => Ok(DataTypeEnum::Varchar(size.map(|s| s as u64))),
+            DataType::Text => Ok(DataTypeEnum::Text),
+            DataType::Int(_) | DataType::Integer(_) => Ok(DataTypeEnum::Integer),
+            DataType::BigInt(_) => Ok(DataTypeEnum::BigInt),
+            DataType::Float(_) | DataType::Real => Ok(DataTypeEnum::Float),
+            DataType::Double | DataType::DoublePrecision => Ok(DataTypeEnum::Double),
+            DataType::Boolean => Ok(DataTypeEnum::Boolean),
+            DataType::Date => Ok(DataTypeEnum::Date),
+            DataType::Timestamp(_, _) => Ok(DataTypeEnum::Timestamp),
+            _ => bail!("Unsupported data type: {:?}", data_type),
+        }
+    }
+
+    fn convert_table_constraint(&self, constraint: &TableConstraint) -> Result<TableConstraintDef> {
+        match constraint {
+            TableConstraint::PrimaryKey { columns, .. } => {
+                let column_names = columns.iter()
+                    .map(|col| col.value.clone())
+                    .collect();
+                Ok(TableConstraintDef::PrimaryKey { columns: column_names })
+            }
+            TableConstraint::ForeignKey { 
+                columns, 
+                foreign_table, 
+                referred_columns, 
+                .. 
+            } => {
+                let column_names = columns.iter()
+                    .map(|col| col.value.clone())
+                    .collect();
+                let foreign_table_name = self.extract_table_name(foreign_table)?;
+                let foreign_column_names = referred_columns.iter()
+                    .map(|col| col.value.clone())
+                    .collect();
+                
+                Ok(TableConstraintDef::ForeignKey {
+                    columns: column_names,
+                    foreign_table: foreign_table_name,
+                    foreign_columns: foreign_column_names,
+                })
+            }
+            TableConstraint::Unique { columns, .. } => {
+                let column_names = columns.iter()
+                    .map(|col| col.value.clone())
+                    .collect();
+                Ok(TableConstraintDef::Unique { columns: column_names })
+            }
+            TableConstraint::Check { expr, .. } => {
+                let logical_expr = self.expr_to_logical_expr(expr)?;
+                Ok(TableConstraintDef::Check { expr: logical_expr })
+            }
+            _ => bail!("Unsupported table constraint: {:?}", constraint),
+        }
+    }
+        let table_name = match &delete.tables.first() {
+            Some(table_ref) => match table_ref {
+                sqlparser::ast::TableReference::Table {
+                    name, alias: _, ..
+                } => self.extract_table_name(name)?,
+                _ => bail!("Complex table references not supported in DELETE"),
+            },
+            None => bail!("DELETE statement must specify a table"),
+        };
+
+        // Validate table exists in catalog
+        if !self.catalog.contains_key(&table_name) {
+            return Err(anyhow!("Table '{}' does not exist", table_name));
+        }
+
+        let filter = match &delete.selection {
+            Some(expr) => Some(self.expr_to_logical_expr(expr)?),
+            None => None,
+        };
+
+        Ok(LogicalPlan::Delete {
+            table_name,
+            filter,
+        })
+    }
+
+    fn plan_query(&self, query: &Query) -> Result<LogicalPlan> {
+        let select = match &*query.body {
+            SetExpr::Select(select) => select,
+            SetExpr::Query(query) => todo!("Nested queries are not supported yet"),
+            SetExpr::SetOperation {
+                op: _,
+                set_quantifier: _,
+                left: _,
+                right: _,
+            } => todo!("Set operations (UNION, INTERSECT, EXCEPT) are not supported yet"),
+            SetExpr::Values(_values) => todo!(),
+            SetExpr::Insert(_statement) => todo!(),
+            SetExpr::Update(_statement) => todo!(),
+            SetExpr::Delete(_statement) => todo!(),
+            SetExpr::Table(_table) => todo!(),
+        };
+
+        // This will be handling FROM clause, can be both from 'table' or a JOIN
+        // Will resulting LogicalPlan::TableScan|LogicalPlan::Join
+        let mut plan = self.plan_from_clause(&select.from)?;
+
+        // Handle WHERE clause
+        if let Some(predicate_expr) = &select.selection {
+            let predicate = self.expr_to_logical_expr(predicate_expr)?;
+            plan = LogicalPlan::Filter {
+                predicate,
+                input: Box::new(plan),
+            };
+        }
+
+        // This will be handling Projection / selecting column from query
+        let projection_expression = self.plan_projection_clause(&select.projection).unwrap();
+        plan = LogicalPlan::Projection {
+            expressions: projection_expression,
+            input: Box::new(plan),
+        };
+
+        println!("{}", self.format_plan(&plan, 1));
+
+        Ok(plan)
+    }
+
+    pub fn plan_from_clause(&self, from: &[TableWithJoins]) -> Result<LogicalPlan> {
+        if from.is_empty() {
+            return Err(anyhow!("FROM clause is required"));
+        }
+
+        // Handling FROM clause, can be both from
+        let mut plan_table_factor = self.plan_table_factor(&from[0].relation)?;
+
+        // TODO: Add Handling JOIN
+
+        Ok(plan_table_factor)
+    }
+
+    pub fn plan_projection_clause(&self, projection: &[SelectItem]) -> Result<Vec<LogicalExpr>> {
+        let mut expressions = Vec::new();
+
+        for item in projection {
+            match item {
+                SelectItem::UnnamedExpr(expr) => {
+                    expressions.push(self.expr_to_logical_expr(expr)?);
+                }
+                SelectItem::Wildcard(_qualifier) => {
+                    expressions.push(LogicalExpr::Wildcard { table: None });
+                }
+                // SelectItem::ExprWithAlias { expr, alias } => {
+                //     // For now, treat as unnamed expr (alias handling can be added later)
+                //     expressions.push(self.expr_to_logical_expr(expr)?);
+                // }
+                _ => bail!("Unsupported SELECT item, Aliasing Column Still not supported"),
+            }
+        }
+
+        Ok(expressions)
+    }
+
+    pub fn plan_table_factor(&self, table_factor: &TableFactor) -> Result<LogicalPlan> {
+        match table_factor {
+            TableFactor::Table { name, alias, .. } => {
+                let table_name = self.extract_table_name(name)?;
+                let alias_name = alias.as_ref().map(|a| a.name.value.clone());
+
+                return match self.catalog.get(&table_name) {
+                    Some(schema) => Ok(LogicalPlan::TableScan {
+                        table_name,
+                        alias: alias_name,
+                        projected_schema: schema.clone(),
+                    }),
+                    _ => Err(anyhow!("Table : {} is not exist in database", table_name)),
+                };
+            }
+            _ => Err(anyhow!("Only table scans are supported in FROM clause")),
+        }
+    }
+
+    pub fn extract_table_name(&self, name: &ObjectName) -> Result<String> {
+        if let Some(ObjectNamePart::Identifier(ident)) = name.0.first() {
+            Ok(ident.value.clone())
+        } else {
+            Err(anyhow!("Invalid table name"))
+        }
+    }
+
+    pub fn expr_to_logical_expr(&self, expr: &Expr) -> Result<LogicalExpr> {
+        match expr {
+            Expr::Identifier(ident) => Ok(LogicalExpr::Column {
+                name: ident.value.clone(),
+                table: None,
+            }),
+            Expr::CompoundIdentifier(parts) => {
+                if parts.len() == 2 {
+                    Ok(LogicalExpr::Column {
+                        name: parts[1].value.clone(),
+                        table: Some(parts[0].value.clone()),
+                    })
+                } else {
+                    bail!("Complex compound identifiers not supported")
+                }
+            }
+            Expr::Value(value) => {
+                let scalar_value = match &value.value {
+                    Value::SingleQuotedString(s) => ScalarValue::Utf8(s.clone()),
+                    Value::Number(n, _) => {
+                        if n.contains('.') {
+                            ScalarValue::Float64(n.parse()?)
+                        } else {
+                            ScalarValue::Int64(n.parse()?)
+                        }
+                    }
+                    Value::Boolean(b) => ScalarValue::Boolean(*b),
+                    Value::Null => ScalarValue::Null,
+                    _ => bail!("Unsupported literal value"),
+                };
+                Ok(LogicalExpr::Literal(scalar_value))
+            }
+            Expr::BinaryOp { left, op, right } => Ok(LogicalExpr::BinaryExpr {
+                left: Box::new(self.expr_to_logical_expr(left)?),
+                op: op.clone(),
+                right: Box::new(self.expr_to_logical_expr(right)?),
+            }),
+            Expr::Wildcard => Ok(LogicalExpr::Wildcard { table: None }),
+            _ => bail!("Unsupported expression: {:?}", expr),
+        }
+    }
+
+    fn format_plan(&self, plan: &LogicalPlan, indent: usize) -> String {
+        let indent_str = " ".repeat(indent);
+        match plan {
+            LogicalPlan::TableScan {
+                table_name,
+                alias,
+                projected_schema,
+            } => {
+                let alias_str = alias
+                    .as_ref()
+                    .map(|a| format!(" AS {}", a))
+                    .unwrap_or_default();
+                format!(
+                    "{}-> TableScan: {}{} projection=[{}]\n",
+                    indent_str,
+                    table_name,
+                    alias_str,
+                    projected_schema.join(", ")
+                )
+            }
+            LogicalPlan::Projection { expressions, input } => {
+                let expr_strs: Vec<String> =
+                    expressions.iter().map(|e| format!("{:?}", e)).collect();
+                format!(
+                    "{}-> Projection: [{}]\n{}",
+                    indent_str,
+                    expr_strs.join(", "),
+                    self.format_plan(input, indent + 1)
+                )
+            }
+            LogicalPlan::Filter { predicate, input } => {
+                format!(
+                    "{}-> Filter: {:?}\n{}",
+                    indent_str,
+                    predicate,
+                    self.format_plan(input, indent + 1)
+                )
+            }
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                join_constraint,
+            } => {
+                let constraint_str = join_constraint
+                    .as_ref()
+                    .map(|c| format!(" ON {:?}", c))
+                    .unwrap_or_default();
+                format!(
+                    "{}-> Join: {:?}{}\n{}{}",
+                    indent_str,
+                    join_type,
+                    constraint_str,
+                    self.format_plan(left, indent + 1),
+                    self.format_plan(right, indent + 1)
+                )
+            }
+            LogicalPlan::Insert {
+                table_name,
+                columns,
+                values,
+                source,
+            } => {
+                let columns_str = columns
+                    .as_ref()
+                    .map(|cols| format!(" ({})", cols.join(", ")))
+                    .unwrap_or_default();
+                
+                let mut result = format!(
+                    "{}-> Insert: {}{}\n",
+                    indent_str,
+                    table_name,
+                    columns_str
+                );
+
+                if let Some(source_plan) = source {
+                    result.push_str(&format!("{}  Source:\n{}", indent_str, self.format_plan(source_plan, indent + 2)));
+                } else if !values.is_empty() {
+                    result.push_str(&format!("{}  Values: {} row(s)\n", indent_str, values.len()));
+                }
+
+                result
+            }
+            LogicalPlan::CreateTable {
+                table_name,
+                columns,
+                constraints,
+                if_not_exists,
+            } => {
+                let if_not_exists_str = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+                let mut result = format!(
+                    "{}-> CreateTable: {}{}\n",
+                    indent_str,
+                    table_name,
+                    if_not_exists_str
+                );
+
+                for column in columns {
+                    result.push_str(&format!(
+                        "{}  Column: {} {:?} (nullable: {}, pk: {})\n",
+                        indent_str,
+                        column.name,
+                        column.data_type,
+                        column.nullable,
+                        column.primary_key
+                    ));
+                }
+
+                for constraint in constraints {
+                    result.push_str(&format!(
+                        "{}  Constraint: {:?}\n",
+                        indent_str,
+                        constraint
+                    ));
+                }
+
+                result
+            }
+            LogicalPlan::CreateIndex {
+                index_name,
+                table_name,
+                columns,
+                unique,
+                if_not_exists,
+            } => {
+                let unique_str = if *unique { "UNIQUE " } else { "" };
+                let if_not_exists_str = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+                format!(
+                    "{}-> CreateIndex: {}{}INDEX {}{} ON {} ({})\n",
+                    indent_str,
+                    unique_str,
+                    if_not_exists_str,
+                    index_name,
+                    if_not_exists_str,
+                    table_name,
+                    columns.join(", ")
+                )
+            }
+            LogicalPlan::DropTable {
+                table_names,
+                if_exists,
+                cascade,
+            } => {
+                let if_exists_str = if *if_exists { " IF EXISTS" } else { "" };
+                let cascade_str = if *cascade { " CASCADE" } else { "" };
+                format!(
+                    "{}-> DropTable: {}{}{}\n",
+                    indent_str,
+                    table_names.join(", "),
+                    if_exists_str,
+                    cascade_str
+                )
+            }
+            LogicalPlan::DropIndex {
+                index_names,
+                if_exists,
+                cascade,
+            } => {
+                let if_exists_str = if *if_exists { " IF EXISTS" } else { "" };
+                let cascade_str = if *cascade { " CASCADE" } else { "" };
+                format!(
+                    "{}-> DropIndex: {}{}{}\n",
+                    indent_str,
+                    index_names.join(", "),
+                    if_exists_str,
+                    cascade_str
+                )
+            }
+            LogicalPlan::Update {
+                table_name,
+                assignments,
+                filter,
+                from,
+            } => {
+                let mut result = format!(
+                    "{}-> Update: {} SET [{}]\n",
+                    indent_str,
+                    table_name,
+                    assignments.iter()
+                        .map(|a| format!("{} = {:?}", a.column, a.value))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+
+                if let Some(predicate) = filter {
+                    result.push_str(&format!("{}  WHERE: {:?}\n", indent_str, predicate));
+                }
+
+                if let Some(from_plan) = from {
+                    result.push_str(&format!("{}  FROM:\n{}", indent_str, self.format_plan(from_plan, indent + 2)));
+                }
+
+                result
+            }
+            LogicalPlan::Delete { table_name, filter } => {
+                let mut result = format!("{}-> Delete: {}\n", indent_str, table_name);
+                
+                if let Some(predicate) = filter {
+                    result.push_str(&format!("{}  WHERE: {:?}\n", indent_str, predicate));
+                }
+
+                result
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlparser::{dialect::GenericDialect, parser::Parser};
+
+    fn create_test_catalog() -> HashMap<String, Vec<String>> {
+        let mut catalog = HashMap::new();
+        catalog.insert("users".to_string(), vec!["id".to_string(), "name".to_string(), "email".to_string()]);
+        catalog.insert("orders".to_string(), vec!["id".to_string(), "user_id".to_string(), "total".to_string()]);
+        catalog
+    }
+
+    #[test]
+    fn test_insert_values() {
+        let catalog = create_test_catalog();
+        let planner = Planner::new(catalog);
+        
+        let sql = "INSERT INTO users (name, email) VALUES ('John', 'john@example.com'), ('Jane', 'jane@example.com')";
+        let dialect = GenericDialect {};
+        let ast = Parser::parse_sql(&dialect, sql).unwrap();
+        
+        match planner.generate(&ast[0]) {
+            Ok(LogicalPlan::Insert { table_name, columns, values, source }) => {
+                assert_eq!(table_name, "users");
+                assert_eq!(columns, Some(vec!["name".to_string(), "email".to_string()]));
+                assert_eq!(values.len(), 2);
+                assert!(source.is_none());
+            }
+            _ => panic!("Expected Insert plan"),
+        }
+    }
+
+    #[test]
+    fn test_update_with_where() {
+        let catalog = create_test_catalog();
+        let planner = Planner::new(catalog);
+        
+        let sql = "UPDATE users SET name = 'Updated Name' WHERE id = 1";
+        let dialect = GenericDialect {};
+        let ast = Parser::parse_sql(&dialect, sql).unwrap();
+        
+        match planner.generate(&ast[0]) {
+            Ok(LogicalPlan::Update { table_name, assignments, filter, from: _ }) => {
+                assert_eq!(table_name, "users");
+                assert_eq!(assignments.len(), 1);
+                assert_eq!(assignments[0].column, "name");
+                assert!(filter.is_some());
+            }
+            _ => panic!("Expected Update plan"),
+        }
+    }
+
+    #[test]
+    fn test_create_table() {
+        let catalog = create_test_catalog();
+        let planner = Planner::new(catalog);
+        
+        let sql = "CREATE TABLE products (id INTEGER PRIMARY KEY, name VARCHAR(100) NOT NULL, price FLOAT DEFAULT 0.0)";
+        let dialect = GenericDialect {};
+        let ast = Parser::parse_sql(&dialect, sql).unwrap();
+        
+        match planner.generate(&ast[0]) {
+            Ok(LogicalPlan::CreateTable { table_name, columns, constraints: _, if_not_exists }) => {
+                assert_eq!(table_name, "products");
+                assert_eq!(columns.len(), 3);
+                assert_eq!(columns[0].name, "id");
+                assert_eq!(columns[0].primary_key, true);
+                assert_eq!(columns[1].name, "name");
+                assert_eq!(columns[1].nullable, false);
+                assert!(!if_not_exists);
+            }
+            _ => panic!("Expected CreateTable plan"),
+        }
+    }
+
+    #[test]
+    fn test_create_index() {
+        let catalog = create_test_catalog();
+        let planner = Planner::new(catalog);
+        
+        let sql = "CREATE UNIQUE INDEX idx_user_email ON users (email)";
+        let dialect = GenericDialect {};
+        let ast = Parser::parse_sql(&dialect, sql).unwrap();
+        
+        match planner.generate(&ast[0]) {
+            Ok(LogicalPlan::CreateIndex { index_name, table_name, columns, unique, if_not_exists }) => {
+                assert_eq!(index_name, "idx_user_email");
+                assert_eq!(table_name, "users");
+                assert_eq!(columns, vec!["email"]);
+                assert!(unique);
+                assert!(!if_not_exists);
+            }
+            _ => panic!("Expected CreateIndex plan"),
+        }
+    }
+
+    #[test]
+    fn test_drop_table() {
+        let catalog = create_test_catalog();
+        let planner = Planner::new(catalog);
+        
+        let sql = "DROP TABLE IF EXISTS users, orders CASCADE";
+        let dialect = GenericDialect {};
+        let ast = Parser::parse_sql(&dialect, sql).unwrap();
+        
+        match planner.generate(&ast[0]) {
+            Ok(LogicalPlan::DropTable { table_names, if_exists, cascade }) => {
+                assert_eq!(table_names, vec!["users", "orders"]);
+                assert!(if_exists);
+                assert!(cascade);
+            }
+            _ => panic!("Expected DropTable plan"),
+        }
+    }
+
+    #[test]
+    fn test_drop_index() {
+        let catalog = create_test_catalog();
+        let planner = Planner::new(catalog);
+        
+        let sql = "DROP INDEX idx_user_email";
+        let dialect = GenericDialect {};
+        let ast = Parser::parse_sql(&dialect, sql).unwrap();
+        
+        match planner.generate(&ast[0]) {
+            Ok(LogicalPlan::DropIndex { index_names, if_exists, cascade }) => {
+                assert_eq!(index_names, vec!["idx_user_email"]);
+                assert!(!if_exists);
+                assert!(!cascade);
+            }
+            _ => panic!("Expected DropIndex plan"),
+        }
+    }
+
+    #[test]
+    fn test_delete_with_where() {
+        let catalog = create_test_catalog();
+        let planner = Planner::new(catalog);
+        
+        let sql = "DELETE FROM users WHERE id = 1";
+        let dialect = GenericDialect {};
+        let ast = Parser::parse_sql(&dialect, sql).unwrap();
+        
+        match planner.generate(&ast[0]) {
+            Ok(LogicalPlan::Delete { table_name, filter }) => {
+                assert_eq!(table_name, "users");
+                assert!(filter.is_some());
+            }
+            _ => panic!("Expected Delete plan"),
+        }
+    },
+}
