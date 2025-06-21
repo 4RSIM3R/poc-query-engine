@@ -1,8 +1,13 @@
+use anyhow::{Ok, Result};
 use mesin::{context::ExecutionContext, get_dialect};
 
-fn main() {
+fn main() -> Result<()> {
     let dialect = get_dialect("postgres");
     let context = ExecutionContext::new(dialect);
-    context.run("SELECT name, salary FROM users where name = ilzam");
-    context.run("SELECT * FROM transactions");
+    let result = context.execute("SELECT email, name FROM users").unwrap();
+    
+
+
+
+    Ok(())
 }

@@ -20,7 +20,7 @@ pub enum LogicalPlan {
         expressions: Vec<LogicalExpr>,
         input: Box<LogicalPlan>,
     },
-    Selection {
+    Filter {
         predicate: LogicalExpr,
         input: Box<LogicalPlan>,
     },
@@ -138,11 +138,11 @@ impl ExecutionContext {
         // Step 1: Handle FROM clause (table scans and joins)
         let mut plan = self.plan_from_clause(&select.from)?;
 
-        // Step 2: Handle WHERE clause (selection/filtering)
-        if let Some(ref selection) = select.selection {
-            let predicate = self.expr_to_logical_expr(selection)?;
-            plan = LogicalPlan::Selection {
-                predicate,
+        // Step 2: Handle WHERE clause (filtering)
+        if let Some(ref where_clause) = select.selection {
+            let filter_predicate = self.expr_to_logical_expr(where_clause)?;
+            plan = LogicalPlan::Filter {
+                predicate: filter_predicate,
                 input: Box::new(plan),
             };
         }
@@ -162,37 +162,65 @@ impl ExecutionContext {
             return Err("FROM clause is required".to_string());
         }
 
+        // Start with the main table from the FROM clause
         let mut plan = self.plan_table_factor(&from[0].relation)?;
 
-        // Handle joins
-        for join in &from[0].joins {
-            let right_plan = self.plan_table_factor(&join.relation)?;
-            let join_type = self.convert_join_operator(&join.join_operator);
-            let join_constraint = match &join.join_operator {
-                JoinOperator::Inner(constraint) | 
-                JoinOperator::LeftOuter(constraint) | 
-                JoinOperator::RightOuter(constraint) | 
-                JoinOperator::FullOuter(constraint) => {
-                    match constraint {
-                        JoinConstraint::On(expr) => Some(self.expr_to_logical_expr(expr)?),
-                        JoinConstraint::Using(_) => None, // Simplified for now
-                        JoinConstraint::Natural => None,
-                        JoinConstraint::None => None,
-                    }
-                }
-                JoinOperator::CrossJoin => None,
-                _ => None,
-            };
+        // Process all joins in sequence
+        for table_with_joins in from {
+            for join in &table_with_joins.joins {
+                let right_plan = self.plan_table_factor(&join.relation)?;
+                let join_type = self.convert_join_operator(&join.join_operator);
+                
+                // Extract join condition from the join constraint
+                let join_constraint = self.extract_join_constraint(&join.join_operator)?;
 
-            plan = LogicalPlan::Join {
-                left: Box::new(plan),
-                right: Box::new(right_plan),
-                join_type,
-                join_constraint,
-            };
+                plan = LogicalPlan::Join {
+                    left: Box::new(plan),
+                    right: Box::new(right_plan),
+                    join_type,
+                    join_constraint,
+                };
+            }
         }
 
         Ok(plan)
+    }
+
+    fn extract_join_constraint(&self, join_op: &JoinOperator) -> Result<Option<LogicalExpr>, String> {
+        let constraint = match join_op {
+            JoinOperator::Inner(constraint) | 
+            JoinOperator::LeftOuter(constraint) | 
+            JoinOperator::RightOuter(constraint) | 
+            JoinOperator::FullOuter(constraint) => constraint,
+            JoinOperator::CrossJoin => return Ok(None),
+            _ => return Ok(None),
+        };
+
+        match constraint {
+            JoinConstraint::On(expr) => {
+                Ok(Some(self.expr_to_logical_expr(expr)?))
+            }
+            JoinConstraint::Using(columns) => {
+                // Convert USING clause to equality conditions
+                if columns.len() == 1 {
+                    let col_name = &columns[0].value;
+                    // Create left.col = right.col condition
+                    // For simplicity, we'll create a basic equality expression
+                    // In a real implementation, you'd need table context to fully qualify column names
+                    Ok(Some(LogicalExpr::Column {
+                        name: col_name.clone(),
+                        table: None,
+                    }))
+                } else {
+                    Err("Multiple column USING clauses not fully supported yet".to_string())
+                }
+            }
+            JoinConstraint::Natural => {
+                // Natural joins would require schema analysis to find common columns
+                Err("NATURAL JOIN not supported yet - requires schema analysis".to_string())
+            }
+            JoinConstraint::None => Ok(None),
+        }
     }
 
     fn plan_table_factor(&self, table_factor: &TableFactor) -> Result<LogicalPlan, String> {
@@ -324,8 +352,8 @@ impl ExecutionContext {
                        indent_str, expr_strs.join(", "), 
                        self.format_plan(input, indent + 1))
             }
-            LogicalPlan::Selection { predicate, input } => {
-                format!("{}Selection: {:?}\n{}", 
+            LogicalPlan::Filter { predicate, input } => {
+                format!("{}Filter: {:?}\n{}", 
                        indent_str, predicate,
                        self.format_plan(input, indent + 1))
             }
@@ -345,7 +373,7 @@ impl ExecutionContext {
         match plan {
             LogicalPlan::TableScan { .. } => 100, // Base scan cost
             LogicalPlan::Projection { input, .. } => 10 + self.estimate_cost(input),
-            LogicalPlan::Selection { input, .. } => 50 + self.estimate_cost(input),
+            LogicalPlan::Filter { input, .. } => 50 + self.estimate_cost(input),
             LogicalPlan::Join { left, right, .. } => {
                 1000 + self.estimate_cost(left) + self.estimate_cost(right)
             }
@@ -373,7 +401,31 @@ mod tests {
         let dialect = Box::new(GenericDialect {});
         let ctx = ExecutionContext::new(dialect);
         
-        let sql = "SELECT id, name FROM users WHERE id > 100";
+        let sql = "SELECT id, name FROM users WHERE id > 100 AND name = 'John'";
+        println!("{}", ctx.explain(sql));
+    }
+
+    #[test]
+    fn test_complex_join_with_filter() {
+        let dialect = Box::new(GenericDialect {});
+        let ctx = ExecutionContext::new(dialect);
+        
+        let sql = "SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE o.amount > 500";
+        println!("{}", ctx.explain(sql));
+    }
+
+    #[test]
+    fn test_multiple_joins() {
+        let dialect = Box::new(GenericDialect {});
+        let ctx = ExecutionContext::new(dialect);
+        
+        let sql = r#"
+            SELECT u.name, o.amount, p.name as product_name 
+            FROM users u 
+            INNER JOIN orders o ON u.id = o.user_id 
+            INNER JOIN products p ON o.product_id = p.id
+            WHERE u.id > 10 AND o.amount > 100
+        "#;
         println!("{}", ctx.explain(sql));
     }
 

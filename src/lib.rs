@@ -4,6 +4,7 @@ use sqlparser::dialect::{
 
 pub mod context;
 pub mod storage;
+pub mod planner;
 
 pub fn get_dialect(dialect: &str) -> Box<dyn Dialect> {
     match dialect {
